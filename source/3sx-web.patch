@@ -1,0 +1,1592 @@
+diff --git a/src/platform/app/sdl/sdl_app.c b/src/platform/app/sdl/sdl_app.c
+index 772a1ead..90878c6a 100644
+--- a/src/platform/app/sdl/sdl_app.c
++++ b/src/platform/app/sdl/sdl_app.c
+@@ -103,6 +103,10 @@ static bool init_window() {
+         window_flags |= SDL_WINDOW_FULLSCREEN;
+     }
+ 
++#ifdef __EMSCRIPTEN__
++    window_flags |= SDL_WINDOW_FILL_DOCUMENT;
++#endif
++
+     int window_width = Config_GetInt(CFG_KEY_WINDOW_WIDTH);
+     window_width = SDL_max(window_width, window_min_width);
+ 
+@@ -385,11 +389,13 @@ static void end_frame() {
+ 
+     Uint64 sleep_time = 0;
+ 
++#ifndef __EMSCRIPTEN__
+     if (now < frame_deadline) {
+         sleep_time = frame_deadline - now;
+         SDL_DelayNS(sleep_time);
+         now = SDL_GetTicksNS();
+     }
++#endif
+ 
+     frame_deadline += target_frame_time_ns;
+ 
+@@ -468,6 +474,17 @@ SDL_AppResult SDL_AppIterate(void* appstate) {
+     }
+ 
+     if (phase == APP_PHASE_INITIALIZED) {
++#ifdef __EMSCRIPTEN__
++        const Uint64 web_now = SDL_GetTicksNS();
++
++        if (frame_deadline == 0) {
++            frame_deadline = web_now;
++        }
++
++        if (web_now + 2000000 < frame_deadline) {
++            return SDL_APP_CONTINUE;
++        }
++#endif
+         begin_frame();
+         Main_StepFrame();
+         end_frame();
+diff --git a/src/platform/video/sdl_generic/sdl_generic_renderer.c b/src/platform/video/sdl_generic/sdl_generic_renderer.c
+index 36bea582..be3ecd36 100644
+--- a/src/platform/video/sdl_generic/sdl_generic_renderer.c
++++ b/src/platform/video/sdl_generic/sdl_generic_renderer.c
+@@ -10,6 +10,10 @@
+ #include "platform/video/opengl/opengl_renderer.h"
+ #endif
+ 
++#if CRS_VIDEO_DRIVER_WEBGL
++#include "platform/video/webgl/webgl_renderer.h"
++#endif
++
+ #include <SDL3/SDL.h>
+ 
+ static SDLRenderBackend* backend_candidates[] = {
+@@ -19,6 +23,9 @@ static SDLRenderBackend* backend_candidates[] = {
+ #if CRS_VIDEO_DRIVER_OPENGL
+     &opengl_render_backend,
+ #endif
++#if CRS_VIDEO_DRIVER_WEBGL
++    &webgl_render_backend,
++#endif
+ };
+ 
+ static SDLRenderBackend* chosen_backend = NULL;
+diff --git a/src/platform/video/webgl/webgl_renderer.c b/src/platform/video/webgl/webgl_renderer.c
+new file mode 100644
+index 00000000..8dbcb9cf
+--- /dev/null
++++ b/src/platform/video/webgl/webgl_renderer.c
+@@ -0,0 +1,817 @@
++#if CRS_VIDEO_DRIVER_WEBGL
++
++#include "platform/video/webgl/webgl_renderer.h"
++#include "common.h"
++#include "port/utils.h"
++#include "sf33rd/AcrSDK/ps2/flps2etc.h"
++#include "sf33rd/AcrSDK/ps2/flps2render.h"
++#include "sf33rd/AcrSDK/ps2/foundaps2.h"
++
++#include <GLES3/gl3.h>
++#include "stb/stb_ds.h"
++#include <SDL3/SDL.h>
++
++#include <libgraph.h>
++
++#define QUADS_MAX 1024
++
++typedef enum GLPaletteType : Uint8 {
++    PALETTE_NONE = 0,
++    PALETTE_4,
++    PALETTE_8,
++} GLPaletteType;
++
++typedef struct GLVec2 {
++    float x;
++    float y;
++} GLVec2;
++
++typedef struct GLVec3 {
++    float x;
++    float y;
++    float z;
++} GLVec3;
++
++typedef struct GLTexCoord {
++    float s;
++    float t;
++} GLTexCoord;
++
++typedef struct GLColor {
++    float r;
++    float g;
++    float b;
++    float a;
++} GLColor;
++
++typedef struct GLVertex {
++    GLVec3 position;
++    GLTexCoord tex_coord;
++    GLColor color;
++} GLVertex;
++
++typedef struct GLTexture {
++    GLuint handle;
++    Uint16 width;
++    Uint16 height;
++    GLPaletteType palette_type;
++} GLTexture;
++
++typedef struct GLTextureSpec {
++    GLTexture texture;
++    GLuint palette;
++} GLTextureSpec;
++
++typedef struct GLQuad {
++    GLVec2 positions[4];
++    GLTexCoord tex_coords[4];
++    float z;
++    Uint32 index;
++    GLTextureSpec texture_spec;
++    GLColor color;
++} GLQuad;
++
++static SDL_Window* window = NULL;
++static SDL_GLContext* gl_context = NULL;
++
++static GLuint canvas_fbo = 0;
++static GLuint canvas_color_tex = 0;
++static GLuint canvas_depth_tex = 0;
++
++static GLuint solid_shader = 0;
++static GLuint palette_4_shader = 0;
++static GLuint palette_8_shader = 0;
++static GLuint direct_shader = 0;
++
++static GLuint vertex_array = 0;
++static GLuint vertex_buffer = 0;
++static GLQuad* quads = NULL;
++static GLVertex* vertices = NULL;
++
++static GLTexture textures[FL_TEXTURE_MAX] = { 0 };
++static GLuint palettes[FL_PALETTE_MAX] = { 0 };
++static GLTextureSpec latest_texture_spec = { 0 };
++
++static const char* shader_vert =
++    "#version 300 es\n"
++    "layout (location = 0) in vec3 aPos;\n"
++    "layout (location = 1) in vec2 aTexCoord;\n"
++    "layout (location = 2) in vec4 aColor;\n"
++    "out vec2 vTexCoord;\n"
++    "out vec4 vColor;\n"
++    "void main() {\n"
++    "    gl_Position = vec4(aPos.x, aPos.y, aPos.z, 1.0);\n"
++    "    vTexCoord = aTexCoord;\n"
++    "    vColor = aColor;\n"
++    "}\n";
++
++static const char* shader_frag_direct =
++    "#version 300 es\n"
++    "precision highp float;\n"
++    "in vec4 vColor;\n"
++    "in vec2 vTexCoord;\n"
++    "out vec4 FragColor;\n"
++    "uniform sampler2D uTexture;\n"
++    "void main() {\n"
++    "    FragColor = texture(uTexture, vTexCoord) * vColor;\n"
++    "    if (FragColor.a == 0.0) { discard; }\n"
++    "}\n";
++
++static const char* shader_frag_palette_4 =
++    "#version 300 es\n"
++    "precision highp float;\n"
++    "precision highp int;\n"
++    "precision highp usampler2D;\n"
++    "uniform sampler2D uPalette;\n"
++    "uniform usampler2D uIndexTex;\n"
++    "uniform ivec2 uTextureSize;\n"
++    "in vec4 vColor;\n"
++    "in vec2 vTexCoord;\n"
++    "out vec4 FragColor;\n"
++    "uint fetch4bppIndex(vec2 uv) {\n"
++    "    ivec2 pixelCoord = ivec2(int(uv.x * float(uTextureSize.x)), int(uv.y * float(uTextureSize.y)));\n"
++    "    int packedX = pixelCoord.x / 2;\n"
++    "    uint packedTexel = texelFetch(uIndexTex, ivec2(packedX, pixelCoord.y), 0).r;\n"
++    "    return ((pixelCoord.x & 1) == 0) ? (packedTexel & 0xFu) : ((packedTexel >> 4) & 0xFu);\n"
++    "}\n"
++    "void main() {\n"
++    "    uint index = fetch4bppIndex(vTexCoord);\n"
++    "    vec4 color = texelFetch(uPalette, ivec2(int(index), 0), 0);\n"
++    "    FragColor = color * vColor;\n"
++    "    if (FragColor.a == 0.0) { discard; }\n"
++    "}\n";
++
++static const char* shader_frag_palette_8 =
++    "#version 300 es\n"
++    "precision highp float;\n"
++    "precision highp int;\n"
++    "precision highp usampler2D;\n"
++    "in vec4 vColor;\n"
++    "in vec2 vTexCoord;\n"
++    "out vec4 FragColor;\n"
++    "uniform sampler2D uPalette;\n"
++    "uniform usampler2D uIndexTex;\n"
++    "void main() {\n"
++    "    uint index = texture(uIndexTex, vTexCoord).r;\n"
++    "    vec4 color = texelFetch(uPalette, ivec2(int(index), 0), 0);\n"
++    "    FragColor = color * vColor;\n"
++    "    if (FragColor.a == 0.0) { discard; }\n"
++    "}\n";
++
++static const char* shader_frag_solid =
++    "#version 300 es\n"
++    "precision highp float;\n"
++    "in vec4 vColor;\n"
++    "in vec2 vTexCoord;\n"
++    "out vec4 FragColor;\n"
++    "void main() {\n"
++    "    FragColor = vColor;\n"
++    "}\n";
++
++static Uint8* convert_buffer = NULL;
++static size_t convert_buffer_size = 0;
++
++static Uint8* get_convert_buffer(size_t size) {
++    if (size > convert_buffer_size) {
++        convert_buffer = SDL_realloc(convert_buffer, size);
++        convert_buffer_size = size;
++    }
++
++    return convert_buffer;
++}
++
++static const Uint8* convert_rgb5a1(const void* src, size_t count) {
++    const Uint16* in = src;
++    Uint8* out = get_convert_buffer(count * 4);
++
++    for (size_t i = 0; i < count; i++) {
++        const Uint16 v = in[i];
++        const Uint8 r = v & 0x1F;
++        const Uint8 g = (v >> 5) & 0x1F;
++        const Uint8 b = (v >> 10) & 0x1F;
++        out[i * 4 + 0] = (r << 3) | (r >> 2);
++        out[i * 4 + 1] = (g << 3) | (g >> 2);
++        out[i * 4 + 2] = (b << 3) | (b >> 2);
++        out[i * 4 + 3] = (v & 0x8000) ? 0xFF : 0;
++    }
++
++    return out;
++}
++
++static const Uint8* convert_bgra(const void* src, size_t count) {
++    const Uint8* in = src;
++    Uint8* out = get_convert_buffer(count * 4);
++
++    for (size_t i = 0; i < count; i++) {
++        out[i * 4 + 0] = in[i * 4 + 2];
++        out[i * 4 + 1] = in[i * 4 + 1];
++        out[i * 4 + 2] = in[i * 4 + 0];
++        out[i * 4 + 3] = in[i * 4 + 3];
++    }
++
++    return out;
++}
++
++static GLuint compile_shader(GLenum type, const char* source) {
++    char info_log[512];
++    GLint success;
++    const GLuint shader = glCreateShader(type);
++    glShaderSource(shader, 1, &source, NULL);
++    glCompileShader(shader);
++    glGetShaderiv(shader, GL_COMPILE_STATUS, &success);
++
++    if (!success) {
++        glGetShaderInfoLog(shader, sizeof(info_log), NULL, info_log);
++        SDL_LogError(SDL_LOG_CATEGORY_RENDER, "Error compiling shader: %s", info_log);
++        glDeleteShader(shader);
++        return 0;
++    }
++
++    return shader;
++}
++
++static GLuint build_shader_program(const char* vertex_shader_source, const char* fragment_shader_source) {
++    char info_log[512];
++    GLint success;
++
++    const GLuint vertex_shader = compile_shader(GL_VERTEX_SHADER, vertex_shader_source);
++
++    if (vertex_shader == 0) {
++        return 0;
++    }
++
++    const GLuint fragment_shader = compile_shader(GL_FRAGMENT_SHADER, fragment_shader_source);
++
++    if (fragment_shader == 0) {
++        glDeleteShader(vertex_shader);
++        return 0;
++    }
++
++    const GLuint program = glCreateProgram();
++    glAttachShader(program, vertex_shader);
++    glAttachShader(program, fragment_shader);
++    glLinkProgram(program);
++    glGetProgramiv(program, GL_LINK_STATUS, &success);
++    glDeleteShader(vertex_shader);
++    glDeleteShader(fragment_shader);
++
++    if (!success) {
++        glGetProgramInfoLog(program, sizeof(info_log), NULL, info_log);
++        SDL_LogError(SDL_LOG_CATEGORY_RENDER, "Error linking shader program: %s", info_log);
++        glDeleteProgram(program);
++        return 0;
++    }
++
++    return program;
++}
++
++static float convert_to_screen_x(float x) {
++    x /= 384;
++    x *= 2;
++    x -= 1;
++    return x;
++}
++
++static float convert_to_screen_y(float y) {
++    y /= 224;
++    y *= 2;
++    y -= 1;
++    y *= -1;
++    return y;
++}
++
++static float convert_color_component(Uint8 component) {
++    return (float)component / (float)SDL_MAX_UINT8;
++}
++
++static GLColor convert_color(Uint32 color) {
++    return (GLColor) {
++        .r = convert_color_component((color >> 16) & 0xFF),
++        .g = convert_color_component((color >> 8) & 0xFF),
++        .b = convert_color_component(color & 0xFF),
++        .a = convert_color_component(color >> 24),
++    };
++}
++
++static void quad_infer_positions(GLQuad* quad) {
++    quad->positions[1].x = quad->positions[3].x;
++    quad->positions[1].y = quad->positions[0].y;
++    quad->positions[2].x = quad->positions[0].x;
++    quad->positions[2].y = quad->positions[3].y;
++}
++
++static void quad_infer_tex_coords(GLQuad* quad) {
++    quad->tex_coords[1].s = quad->tex_coords[3].s;
++    quad->tex_coords[1].t = quad->tex_coords[0].t;
++    quad->tex_coords[2].s = quad->tex_coords[0].s;
++    quad->tex_coords[2].t = quad->tex_coords[3].t;
++}
++
++static void WebGLRenderer_CreateTexture(unsigned int th) {
++    const int texture_index = LO_16_BITS(th) - 1;
++    const FLTexture* fl_texture = &flTexture[texture_index];
++    const void* pixels = flPS2GetSystemBuffAdrs(fl_texture->mem_handle);
++
++    if (textures[texture_index].handle != 0) {
++        glDeleteTextures(1, &textures[texture_index].handle);
++        SDL_zero(textures[texture_index]);
++    }
++
++    GLint internal_format;
++    GLenum format;
++    GLenum type;
++    GLPaletteType palette_type = PALETTE_NONE;
++    GLsizei buffer_width = fl_texture->width;
++
++    switch (fl_texture->format) {
++    case SCE_GS_PSMT8:
++        internal_format = GL_R8UI;
++        format = GL_RED_INTEGER;
++        type = GL_UNSIGNED_BYTE;
++        palette_type = PALETTE_8;
++        break;
++
++    case SCE_GS_PSMT4:
++        internal_format = GL_R8UI;
++        format = GL_RED_INTEGER;
++        type = GL_UNSIGNED_BYTE;
++        palette_type = PALETTE_4;
++        buffer_width /= 2;
++        break;
++
++    case SCE_GS_PSMCT16:
++        internal_format = GL_RGBA8;
++        format = GL_RGBA;
++        type = GL_UNSIGNED_BYTE;
++        palette_type = PALETTE_NONE;
++        pixels = convert_rgb5a1(pixels, (size_t)fl_texture->width * fl_texture->height);
++        break;
++
++    case SCE_GS_PSMCT32:
++        internal_format = GL_RGBA8;
++        format = GL_RGBA;
++        type = GL_UNSIGNED_BYTE;
++        palette_type = PALETTE_NONE;
++        break;
++
++    default:
++        fatal_error("Unhandled pixel format: %d", fl_texture->format);
++        break;
++    }
++
++    GLuint texture;
++    glGenTextures(1, &texture);
++    glBindTexture(GL_TEXTURE_2D, texture);
++    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
++    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
++    glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
++    glTexImage2D(GL_TEXTURE_2D, 0, internal_format, buffer_width, fl_texture->height, 0, format, type, pixels);
++
++    textures[texture_index] = (GLTexture) {
++        .handle = texture,
++        .width = fl_texture->width,
++        .height = fl_texture->height,
++        .palette_type = palette_type,
++    };
++}
++
++static void WebGLRenderer_DestroyTexture(unsigned int texture_handle) {
++    // Do nothing
++}
++
++static void WebGLRenderer_UnlockTexture(unsigned int th) {
++    WebGLRenderer_CreateTexture(th);
++}
++
++static void WebGLRenderer_CreatePalette(unsigned int ph) {
++    const int palette_index = HI_16_BITS(ph) - 1;
++    const FLTexture* fl_palette = &flPalette[palette_index];
++    const void* pixels = flPS2GetSystemBuffAdrs(fl_palette->mem_handle);
++    const int color_count = fl_palette->width * fl_palette->height;
++
++    if (palettes[palette_index] != 0) {
++        glDeleteTextures(1, &palettes[palette_index]);
++        palettes[palette_index] = 0;
++    }
++
++    GLint internal_format;
++    GLenum format;
++    GLenum type;
++
++    internal_format = GL_RGBA8;
++    format = GL_RGBA;
++    type = GL_UNSIGNED_BYTE;
++
++    switch (fl_palette->format) {
++    case SCE_GS_PSMCT32:
++        pixels = convert_bgra(pixels, color_count);
++        break;
++
++    case SCE_GS_PSMCT16:
++        pixels = convert_rgb5a1(pixels, color_count);
++        break;
++
++    default:
++        fatal_error("Unhandled pixel format: %d", fl_palette->format);
++        break;
++    }
++
++    GLuint palette;
++    glGenTextures(1, &palette);
++    glBindTexture(GL_TEXTURE_2D, palette);
++    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
++    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
++    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
++    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
++    glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
++    glTexImage2D(GL_TEXTURE_2D, 0, internal_format, color_count, 1, 0, format, type, pixels);
++
++    palettes[palette_index] = palette;
++}
++
++static void WebGLRenderer_DestroyPalette(unsigned int palette_handle) {
++    // Do nothing
++}
++
++static void WebGLRenderer_UnlockPalette(unsigned int ph) {
++    WebGLRenderer_CreatePalette(ph << 16);
++}
++
++static void WebGLRenderer_SetTexture(unsigned int th) {
++    const int texture_handle = LO_16_BITS(th);
++    const int texture_index = texture_handle - 1;
++    latest_texture_spec.texture = textures[texture_index];
++
++    const int palette_handle = HI_16_BITS(th);
++
++    if (palette_handle > 0) {
++        const int palette_index = palette_handle - 1;
++        latest_texture_spec.palette = palettes[palette_index];
++    } else {
++        latest_texture_spec.palette = 0;
++    }
++}
++
++static void WebGLRenderer_DrawTexturedQuad(const Sprite* sprite, unsigned int color) {
++    SDL_assert(arrlen(quads) < QUADS_MAX);
++
++    GLQuad* quad = arraddnptr(quads, 1);
++
++    for (int i = 0; i < 4; i++) {
++        quad->positions[i].x = convert_to_screen_x(sprite->v[i].x);
++        quad->positions[i].y = convert_to_screen_y(sprite->v[i].y);
++        quad->tex_coords[i].s = sprite->t[i].s;
++        quad->tex_coords[i].t = sprite->t[i].t;
++    }
++
++    quad->z = sprite->v[0].z;
++    quad->index = arrlen(quads);
++    quad->color = convert_color(color);
++    quad->texture_spec = latest_texture_spec;
++}
++
++static void WebGLRenderer_DrawSprite(const Sprite* sprite, unsigned int color) {
++    SDL_assert(arrlen(quads) < QUADS_MAX);
++
++    GLQuad* quad = arraddnptr(quads, 1);
++
++    quad->positions[0].x = convert_to_screen_x(sprite->v[0].x);
++    quad->positions[0].y = convert_to_screen_y(sprite->v[0].y);
++    quad->positions[3].x = convert_to_screen_x(sprite->v[3].x);
++    quad->positions[3].y = convert_to_screen_y(sprite->v[3].y);
++    quad_infer_positions(quad);
++
++    quad->tex_coords[0].s = sprite->t[0].s;
++    quad->tex_coords[0].t = sprite->t[0].t;
++    quad->tex_coords[3].s = sprite->t[3].s;
++    quad->tex_coords[3].t = sprite->t[3].t;
++    quad_infer_tex_coords(quad);
++
++    quad->z = sprite->v[0].z;
++    quad->index = arrlen(quads);
++    quad->color = convert_color(color);
++    quad->texture_spec = latest_texture_spec;
++}
++
++static void WebGLRenderer_DrawSprite2(const Sprite2* sprite2) {
++    SDL_assert(arrlen(quads) < QUADS_MAX);
++
++    GLQuad* quad = arraddnptr(quads, 1);
++
++    quad->positions[0].x = convert_to_screen_x(sprite2->v[0].x);
++    quad->positions[0].y = convert_to_screen_y(sprite2->v[0].y);
++    quad->positions[3].x = convert_to_screen_x(sprite2->v[1].x);
++    quad->positions[3].y = convert_to_screen_y(sprite2->v[1].y);
++    quad_infer_positions(quad);
++
++    quad->tex_coords[0].s = sprite2->t[0].s;
++    quad->tex_coords[0].t = sprite2->t[0].t;
++    quad->tex_coords[3].s = sprite2->t[1].s;
++    quad->tex_coords[3].t = sprite2->t[1].t;
++    quad_infer_tex_coords(quad);
++
++    quad->z = sprite2->v[0].z;
++    quad->index = arrlen(quads);
++    quad->color = convert_color(sprite2->vertex_color);
++    quad->texture_spec = latest_texture_spec;
++}
++
++static void WebGLRenderer_DrawSolidQuad(const Quad* quad, unsigned int color) {
++    SDL_assert(arrlen(quads) < QUADS_MAX);
++
++    GLQuad* _quad = arraddnptr(quads, 1);
++
++    for (int i = 0; i < 4; i++) {
++        _quad->positions[i].x = convert_to_screen_x(quad->v[i].x);
++        _quad->positions[i].y = convert_to_screen_y(quad->v[i].y);
++    }
++
++    _quad->z = quad->v[0].z;
++    _quad->index = arrlen(quads);
++    _quad->color = convert_color(color);
++    SDL_zero(_quad->texture_spec);
++}
++
++static SDL_Window* WebGLRenderer_Init(const SDLRenderBackendInitInfo* init_info) {
++    // Init window
++
++    SDL_GL_SetAttribute(SDL_GL_CONTEXT_MAJOR_VERSION, 3);
++    SDL_GL_SetAttribute(SDL_GL_CONTEXT_MINOR_VERSION, 0);
++    SDL_GL_SetAttribute(SDL_GL_CONTEXT_PROFILE_MASK, SDL_GL_CONTEXT_PROFILE_ES);
++    SDL_GL_SetAttribute(SDL_GL_DOUBLEBUFFER, 1);
++
++    window = SDL_CreateWindow(
++        init_info->app_name,
++        init_info->window_width,
++        init_info->window_height,
++        init_info->window_flags | SDL_WINDOW_OPENGL
++    );
++
++    if (window == NULL) {
++        SDL_Log("Failed to create window: %s", SDL_GetError());
++        return NULL;
++    }
++
++    gl_context = SDL_GL_CreateContext(window);
++
++    if (gl_context == NULL) {
++        SDL_Log("Failed to create GL context: %s", SDL_GetError());
++        SDL_DestroyWindow(window);
++        return NULL;
++    }
++
++    SDL_GL_SetSwapInterval(0); // No vsync
++
++    // Init common vars
++
++    arrsetcap(quads, QUADS_MAX);
++    vertices = SDL_calloc(QUADS_MAX * 4, sizeof(GLVertex));
++
++    // Configure canvas
++
++    glGenTextures(1, &canvas_color_tex);
++    glBindTexture(GL_TEXTURE_2D, canvas_color_tex);
++    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
++    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
++    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, 384, 224, 0, GL_RGBA, GL_UNSIGNED_BYTE, NULL);
++
++    glGenRenderbuffers(1, &canvas_depth_tex);
++    glBindRenderbuffer(GL_RENDERBUFFER, canvas_depth_tex);
++    glRenderbufferStorage(GL_RENDERBUFFER, GL_DEPTH_COMPONENT24, 384, 224);
++
++    glGenFramebuffers(1, &canvas_fbo);
++    glBindFramebuffer(GL_FRAMEBUFFER, canvas_fbo);
++    glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, canvas_color_tex, 0);
++    glFramebufferRenderbuffer(GL_FRAMEBUFFER, GL_DEPTH_ATTACHMENT, GL_RENDERBUFFER, canvas_depth_tex);
++
++    glBindFramebuffer(GL_FRAMEBUFFER, 0);
++
++    // Configure shaders
++
++    solid_shader = build_shader_program(shader_vert, shader_frag_solid);
++    if (solid_shader == 0) {
++        SDL_Log("Failed to initialize OpenGL shaders");
++        SDL_GL_DestroyContext(gl_context);
++        SDL_DestroyWindow(window);
++        gl_context = NULL;
++        window = NULL;
++        return NULL;
++    }
++
++    palette_4_shader = build_shader_program(shader_vert, shader_frag_palette_4);
++
++    if (palette_4_shader == 0) {
++        SDL_Log("Failed to initialize OpenGL shaders");
++        SDL_GL_DestroyContext(gl_context);
++        SDL_DestroyWindow(window);
++        gl_context = NULL;
++        window = NULL;
++        return NULL;
++    }
++
++    glUseProgram(palette_4_shader);
++    glUniform1i(glGetUniformLocation(palette_4_shader, "uPalette"), 0);
++    glUniform1i(glGetUniformLocation(palette_4_shader, "uIndexTex"), 1);
++
++    palette_8_shader = build_shader_program(shader_vert, shader_frag_palette_8);
++
++    if (palette_8_shader == 0) {
++        SDL_Log("Failed to initialize OpenGL shaders");
++        SDL_GL_DestroyContext(gl_context);
++        SDL_DestroyWindow(window);
++        gl_context = NULL;
++        window = NULL;
++        return NULL;
++    }
++
++    glUseProgram(palette_8_shader);
++    glUniform1i(glGetUniformLocation(palette_8_shader, "uPalette"), 0);
++    glUniform1i(glGetUniformLocation(palette_8_shader, "uIndexTex"), 1);
++
++    direct_shader = build_shader_program(shader_vert, shader_frag_direct);
++
++    if (direct_shader == 0) {
++        SDL_Log("Failed to initialize OpenGL shaders");
++        SDL_GL_DestroyContext(gl_context);
++        SDL_DestroyWindow(window);
++        gl_context = NULL;
++        window = NULL;
++        return NULL;
++    }
++
++    glUseProgram(direct_shader);
++    glUniform1i(glGetUniformLocation(direct_shader, "uTexture"), 0);
++
++    // Setup vertex data and buffers
++
++    glGenVertexArrays(1, &vertex_array);
++    glGenBuffers(1, &vertex_buffer);
++    GLuint element_buffer;
++    glGenBuffers(1, &element_buffer);
++
++    glBindVertexArray(vertex_array);
++
++    glBindBuffer(GL_ARRAY_BUFFER, vertex_buffer);
++    glBufferData(GL_ARRAY_BUFFER, QUADS_MAX * 4 * sizeof(GLVertex), NULL, GL_DYNAMIC_DRAW);
++
++    // Pre-compute indices
++    GLuint indices[QUADS_MAX * 6];
++
++    for (int i = 0; i < QUADS_MAX; i++) {
++        indices[i * 6 + 0] = i * 4 + 0;
++        indices[i * 6 + 1] = i * 4 + 1;
++        indices[i * 6 + 2] = i * 4 + 2;
++        indices[i * 6 + 3] = i * 4 + 2;
++        indices[i * 6 + 4] = i * 4 + 1;
++        indices[i * 6 + 5] = i * 4 + 3;
++    }
++
++    glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, element_buffer);
++    glBufferData(GL_ELEMENT_ARRAY_BUFFER, sizeof(indices), indices, GL_STATIC_DRAW);
++
++    // aPos
++    glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, sizeof(GLVertex), (GLvoid*)offsetof(GLVertex, position));
++    glEnableVertexAttribArray(0);
++    // aTexCoord
++    glVertexAttribPointer(1, 2, GL_FLOAT, GL_FALSE, sizeof(GLVertex), (GLvoid*)offsetof(GLVertex, tex_coord));
++    glEnableVertexAttribArray(1);
++    // aColor
++    glVertexAttribPointer(2, 4, GL_FLOAT, GL_FALSE, sizeof(GLVertex), (GLvoid*)offsetof(GLVertex, color));
++    glEnableVertexAttribArray(2);
++
++    glBindBuffer(GL_ARRAY_BUFFER, 0);
++    glBindVertexArray(0);
++
++    // Misc
++
++    glEnable(GL_BLEND);
++    glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
++
++
++    return window;
++}
++
++static void WebGLRenderer_Quit() {
++    // TODO: Implement
++}
++
++static void WebGLRenderer_RenderFrame(SDL_Rect viewport) {
++    glClearColor(0.0f, 0.0f, 0.0f, 1.0f);
++    glBindVertexArray(vertex_array);
++    glBindBuffer(GL_ARRAY_BUFFER, vertex_buffer);
++
++    // Draw to canvas
++
++    glBindFramebuffer(GL_FRAMEBUFFER, canvas_fbo);
++    glViewport(0, 0, 384, 224);
++    glEnable(GL_DEPTH_TEST);
++    glDepthFunc(GL_LEQUAL);
++    glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
++
++    for (int i = 0; i < arrlen(quads); i++) {
++        const int vertex_base = i * 4;
++        const GLQuad* quad = &quads[i];
++
++        for (int i = 0; i < 4; i++) {
++            vertices[vertex_base + i].position.x = quad->positions[i].x;
++            vertices[vertex_base + i].position.y = quad->positions[i].y;
++            vertices[vertex_base + i].position.z = quad->z;
++            vertices[vertex_base + i].tex_coord = quad->tex_coords[i];
++            vertices[vertex_base + i].color = quad->color;
++        }
++    }
++
++    glBufferSubData(GL_ARRAY_BUFFER, 0, sizeof(GLVertex) * arrlen(quads) * 4, vertices);
++
++    for (int i = 0; i < arrlen(quads); i++) {
++        const GLQuad* quad = &quads[i];
++
++        if (quad->texture_spec.texture.handle == 0) {
++            glUseProgram(solid_shader);
++        } else {
++            switch (quad->texture_spec.texture.palette_type) {
++            case PALETTE_4:
++                glUseProgram(palette_4_shader);
++                const GLint texture_size_loc = glGetUniformLocation(palette_4_shader, "uTextureSize");
++                glUniform2i(texture_size_loc, quad->texture_spec.texture.width, quad->texture_spec.texture.width);
++                glActiveTexture(GL_TEXTURE0);
++                glBindTexture(GL_TEXTURE_2D, quad->texture_spec.palette);
++                glActiveTexture(GL_TEXTURE1);
++                glBindTexture(GL_TEXTURE_2D, quad->texture_spec.texture.handle);
++                break;
++
++            case PALETTE_8:
++                SDL_assert(quad->texture_spec.palette != 0);
++                glUseProgram(palette_8_shader);
++                glActiveTexture(GL_TEXTURE0);
++                glBindTexture(GL_TEXTURE_2D, quad->texture_spec.palette);
++                glActiveTexture(GL_TEXTURE1);
++                glBindTexture(GL_TEXTURE_2D, quad->texture_spec.texture.handle);
++                break;
++
++            case PALETTE_NONE:
++                glUseProgram(direct_shader);
++                glActiveTexture(GL_TEXTURE0);
++                glBindTexture(GL_TEXTURE_2D, quad->texture_spec.texture.handle);
++                break;
++            }
++        }
++
++        glDrawElements(GL_TRIANGLES, 6, GL_UNSIGNED_INT, (GLvoid*)(sizeof(GLuint) * 6 * i));
++    }
++
++    // Draw canvas to window
++
++    GLVertex screen_vertices[4] = {
++        { .position = { .x = -1, .y = 1 }, .tex_coord = { .s = 0, .t = 1 } },
++        { .position = { .x = 1, .y = 1 }, .tex_coord = { .s = 1, .t = 1 } },
++        { .position = { .x = -1, .y = -1 }, .tex_coord = { .s = 0, .t = 0 } },
++        { .position = { .x = 1, .y = -1 }, .tex_coord = { .s = 1, .t = 0 } },
++    };
++
++    for (int i = 0; i < SDL_arraysize(screen_vertices); i++) {
++        screen_vertices[i].color = (GLColor) { .r = 1, .g = 1, .b = 1, .a = 1 };
++    }
++
++    glBufferSubData(GL_ARRAY_BUFFER, 0, sizeof(screen_vertices), screen_vertices);
++    glUseProgram(direct_shader);
++    glDisable(GL_BLEND);
++    glDisable(GL_DEPTH_TEST);
++
++    glBindFramebuffer(GL_FRAMEBUFFER, 0);
++    glViewport(viewport.x, viewport.y, viewport.w, viewport.h);
++    glClear(GL_COLOR_BUFFER_BIT);
++
++    glActiveTexture(GL_TEXTURE0);
++    glBindTexture(GL_TEXTURE_2D, canvas_color_tex);
++    glDrawElements(GL_TRIANGLES, 6, GL_UNSIGNED_INT, (GLvoid*)0);
++    glEnable(GL_BLEND);
++
++    // Cleanup
++
++    glBindVertexArray(0);
++    SDL_GL_SwapWindow(window);
++    arrsetlen(quads, 0);
++}
++
++// Internal
++
++const SDLRenderBackend webgl_render_backend = {
++    .name = "WebGL2",
++    .init = WebGLRenderer_Init,
++    .quit = WebGLRenderer_Quit,
++    .render_frame = WebGLRenderer_RenderFrame,
++    .create_texture = WebGLRenderer_CreateTexture,
++    .destroy_texture = WebGLRenderer_DestroyTexture,
++    .unlock_texture = WebGLRenderer_UnlockTexture,
++    .create_palette = WebGLRenderer_CreatePalette,
++    .destroy_palette = WebGLRenderer_DestroyPalette,
++    .unlock_palette = WebGLRenderer_UnlockPalette,
++    .set_texture = WebGLRenderer_SetTexture,
++    .draw_textured_quad = WebGLRenderer_DrawTexturedQuad,
++    .draw_sprite = WebGLRenderer_DrawSprite,
++    .draw_sprite2 = WebGLRenderer_DrawSprite2,
++    .draw_solid_quad = WebGLRenderer_DrawSolidQuad,
++};
++
++#endif // CRS_VIDEO_DRIVER_WEBGL
+diff --git a/src/platform/video/webgl/webgl_renderer.h b/src/platform/video/webgl/webgl_renderer.h
+new file mode 100644
+index 00000000..fd9414a5
+--- /dev/null
++++ b/src/platform/video/webgl/webgl_renderer.h
+@@ -0,0 +1,17 @@
++#if CRS_VIDEO_DRIVER_WEBGL
++
++#ifndef WEBGL_RENDERER_H
++#define WEBGL_RENDERER_H
++
++#include "core/render_primitives.h"
++#include "platform/video/sdl_generic/sdl_render_backend.h"
++
++#include <SDL3/SDL.h>
++
++// Internal
++
++extern const SDLRenderBackend webgl_render_backend;
++
++#endif
++
++#endif // CRS_VIDEO_DRIVER_WEBGL
+diff --git a/src/port/resources.c b/src/port/resources.c
+index eeeb3bc9..73d51d55 100644
+--- a/src/port/resources.c
++++ b/src/port/resources.c
+@@ -7,7 +7,7 @@
+ #include "utils/sha256.h"
+ #endif
+ 
+-#if CRS_APP_DRIVER_SDL
++#if CRS_APP_DRIVER_SDL && !defined(__EMSCRIPTEN__)
+ #include <cdio/iso9660.h>
+ #endif
+ 
+@@ -35,6 +35,10 @@ char* Resources_GetPath(const char* file_path) {
+ }
+ 
+ const char* Resources_GetAFSPath() {
++#ifdef __EMSCRIPTEN__
++    return "/afs/SF33RD.AFS";
++#endif
++
+     if (afs_path == NULL) {
+         afs_path = Resources_GetPath("SF33RD.AFS");
+     }
+@@ -85,7 +89,13 @@ bool Resources_Check() {
+ #endif
+ }
+ 
+-#if CRS_APP_DRIVER_SDL
++#if CRS_APP_DRIVER_SDL && defined(__EMSCRIPTEN__)
++
++bool Resources_RunResourceCopyingFlow() {
++    return Resources_Check();
++}
++
++#elif CRS_APP_DRIVER_SDL
+ 
+ #define ERROR_LEN_MAX 512
+ 
+diff --git a/src/port/sound/spu.c b/src/port/sound/spu.c
+index 5c25ec79..adfece08 100644
+--- a/src/port/sound/spu.c
++++ b/src/port/sound/spu.c
+@@ -324,7 +324,7 @@ void SPU_SDL_CB(void* user, SDL_AudioStream* stream, int additional_amount, int
+     SDL_LockMutex(soundLock);
+ 
+     while (samples_per_channel) {
+-        u32 batch_count = min(samples_per_channel, 4096);
++        u32 batch_count = min(samples_per_channel, SDL_arraysize(outbuf) / 2);
+         s16* p = outbuf;
+         for (int i = 0; i < batch_count; i++) {
+             SPU_Tick(p);
+diff --git a/src/sf33rd/Source/Game/effect/effa2.c b/src/sf33rd/Source/Game/effect/effa2.c
+index c5d2cf42..b70afd0c 100644
+--- a/src/sf33rd/Source/Game/effect/effa2.c
++++ b/src/sf33rd/Source/Game/effect/effa2.c
+@@ -109,7 +109,7 @@ void effect_A2_move(WORK_Other* ewk) {
+     }
+ }
+ 
+-s32 effect_A2_init() {
++s32 effect_A2_init(s32 unused) {
+     WORK_Other* ewk;
+     s16 ix;
+ 
+diff --git a/src/sf33rd/Source/Game/effect/effa2.h b/src/sf33rd/Source/Game/effect/effa2.h
+index 0e3f20ef..cd86bcef 100644
+--- a/src/sf33rd/Source/Game/effect/effa2.h
++++ b/src/sf33rd/Source/Game/effect/effa2.h
+@@ -5,6 +5,6 @@
+ #include "types.h"
+ 
+ void effect_A2_move(WORK_Other* ewk);
+-s32 effect_A2_init();
++s32 effect_A2_init(s32 unused);
+ 
+ #endif
+diff --git a/src/sf33rd/Source/Game/io/pulpul.c b/src/sf33rd/Source/Game/io/pulpul.c
+index 70482c70..ddec2480 100644
+--- a/src/sf33rd/Source/Game/io/pulpul.c
++++ b/src/sf33rd/Source/Game/io/pulpul.c
+@@ -489,19 +489,19 @@ s32 pp_conv_kow(u8 num) {
+     return dokidoki_ix_change_table[ix];
+ }
+ 
+-void pp_pulpara_remake_at_init() {
++void pp_pulpara_remake_at_init(void* unused) {
+     // do nothing
+ }
+ 
+-void pp_pulpara_remake_at_init2() {
++void pp_pulpara_remake_at_init2(void* unused) {
+     // do nothing
+ }
+ 
+-void pp_pulpara_remake_at_hit() {
++void pp_pulpara_remake_at_hit(void* unused) {
+     // do nothing
+ }
+ 
+-void pp_pulpara_remake_at() {
++void pp_pulpara_remake_at(void* unused) {
+     // do nothing
+ }
+ 
+diff --git a/src/sf33rd/Source/Game/io/pulpul.h b/src/sf33rd/Source/Game/io/pulpul.h
+index 6e72d10d..d59e886e 100644
+--- a/src/sf33rd/Source/Game/io/pulpul.h
++++ b/src/sf33rd/Source/Game/io/pulpul.h
+@@ -29,10 +29,10 @@ s32 chkVibUnit(s32 port);
+ void move_pulpul(PPWORK* wk);
+ s32 pulpul_pdVibMxStart(PPWORK* wk, s32 arg1, s32 arg2, PULPARA* param);
+ s32 vibParamTrans(s32 id, PULPARA* prm);
+-void pp_pulpara_remake_at_init();
+-void pp_pulpara_remake_at_init2();
+-void pp_pulpara_remake_at_hit();
+-void pp_pulpara_remake_at();
++void pp_pulpara_remake_at_init(void* unused);
++void pp_pulpara_remake_at_init2(void* unused);
++void pp_pulpara_remake_at_hit(void* unused);
++void pp_pulpara_remake_at(void* unused);
+ void pp_pulpara_remake_dm_all(WORK* wk);
+ void pp_pulpara_guard(WORK* wk);
+ void pp_pulpara_hit(WORK* wk);
+diff --git a/src/sf33rd/Source/Game/sound/sound3rd.c b/src/sf33rd/Source/Game/sound/sound3rd.c
+index 9dd9dee3..e8c218c2 100644
+--- a/src/sf33rd/Source/Game/sound/sound3rd.c
++++ b/src/sf33rd/Source/Game/sound/sound3rd.c
+@@ -229,7 +229,7 @@ void sound_bgm_off() {
+     }
+ }
+ 
+-void setSeVolume() {
++void setSeVolume(s32 unused) {
+     f32 vol;
+ 
+     if (system_init_level & 2) {
+diff --git a/src/sf33rd/Source/Game/sound/sound3rd.h b/src/sf33rd/Source/Game/sound/sound3rd.h
+index d1a1337b..b65040db 100644
+--- a/src/sf33rd/Source/Game/sound/sound3rd.h
++++ b/src/sf33rd/Source/Game/sound/sound3rd.h
+@@ -16,7 +16,7 @@ void checkAdxFileLoaded();
+ void Exit_sound_system();
+ void Init_bgm_work();
+ void sound_all_off();
+-void setSeVolume();
++void setSeVolume(s32 unused);
+ void BGM_Server();
+ void setupAlwaysSeamlessFlag(s16 flag);
+ s32 adx_now_playend();
+diff --git a/web/asan/asan_opts.c b/web/asan/asan_opts.c
+new file mode 100644
+index 00000000..558d5bbc
+--- /dev/null
++++ b/web/asan/asan_opts.c
+@@ -0,0 +1 @@
++const char* __asan_default_options(void) { return "halt_on_error=0:detect_leaks=0:print_summary=1"; }
+diff --git a/web/build.sh b/web/build.sh
+new file mode 100755
+index 00000000..fb983ae3
+--- /dev/null
++++ b/web/build.sh
+@@ -0,0 +1,64 @@
++#!/usr/bin/env bash
++set -euo pipefail
++ROOT="$(cd "$(dirname "$0")/.." && pwd)"
++SDL3_ROOT="${SDL3_ROOT:-$ROOT/web/deps/sdl3}"
++ZLIB_ROOT="${ZLIB_ROOT:-$ROOT/web/deps/zlib}"
++OUT="${OUT:-$ROOT/web/dist}"
++OBJ="${OBJ_DIR:-$ROOT/web/obj}"
++JOBS="${JOBS:-$(nproc 2>/dev/null || echo 4)}"
++mkdir -p "$OUT" "$OBJ"
++
++DEFS=(
++  -DRELEASE=1
++  -DCRS_APP_DRIVER_SDL=1
++  -DCRS_VIDEO_DRIVER_SDL_GENERIC=1
++  -DCRS_VIDEO_DRIVER_WEBGL=1
++  -DCRS_INPUT_DRIVER_SDL=1
++  -DSOUND_ENABLED=1
++)
++CFLAGS=(
++  -O2 ${CFLAGS_EXTRA:-} -std=gnu11 -fno-strict-aliasing
++  -Wno-pointer-to-int-cast -Wno-deprecated-non-prototype -Wno-tautological-overlap-compare
++  -Wno-c2x-extensions -Wno-c23-extensions -Wno-incompatible-pointer-types -Wno-int-conversion
++  -Wno-unused-variable -Wno-unused-function -Wno-unused-but-set-variable
++  -I"$ROOT/src" -I"$ROOT/src/sdk" -I"$SDL3_ROOT/include" -I"$ZLIB_ROOT/include"
++)
++
++mapfile -t SRCS < <(cd "$ROOT" && find src -name '*.c' \
++  -not -path 'src/imgui/*' \
++  -not -path 'src/platform/netplay/*' \
++  -not -path 'src/platform/video/opengl/*' \
++  -not -path 'src/platform/video/sdl_gpu/*' \
++  -not -path 'src/platform/video/psp/*' \
++  -not -path 'src/platform/app/psp/*' \
++  -not -path 'src/platform/input/statcheck/*' \
++  -not -path 'src/test/*' | sort)
++
++compile() {
++  local src="$1"
++  local obj="$OBJ/${src//\//_}.o"
++  if [ ! -f "$obj" ] || [ "$ROOT/$src" -nt "$obj" ]; then
++    emcc "${CFLAGS[@]}" "${DEFS[@]}" -c "$ROOT/$src" -o "$obj" || { echo "FAILED: $src"; return 1; }
++  fi
++  echo "$obj"
++}
++export -f compile
++export ROOT OBJ
++export CFLAGS_STR="${CFLAGS[*]}" DEFS_STR="${DEFS[*]}"
++
++printf '%s\n' "${SRCS[@]}" | xargs -P "$JOBS" -I{} bash -c 'src="{}"; obj="$OBJ/${src//\//_}.o"; if [ ! -f "$obj" ] || [ "$ROOT/$src" -nt "$obj" ]; then emcc $CFLAGS_STR $DEFS_STR -c "$ROOT/$src" -o "$obj" 2>>"$OBJ/errors.log" || echo "FAILED: $src"; fi'
++
++OBJS=()
++for src in "${SRCS[@]}"; do OBJS+=("$OBJ/${src//\//_}.o"); done
++
++emcc -O2 ${LINK_EXTRA:-} "${OBJS[@]}" ${EXTRA_OBJS:-} "$SDL3_ROOT/lib/libSDL3.a" "$ZLIB_ROOT/lib/libz.a" \
++  -sMAX_WEBGL_VERSION=2 -sMIN_WEBGL_VERSION=2 \
++  -sEMULATE_FUNCTION_POINTER_CASTS=1 \
++  -sALLOW_MEMORY_GROWTH=1 -sINITIAL_MEMORY=134217728 -sSTACK_SIZE=4194304 \
++  -sFORCE_FILESYSTEM=1 -sEXIT_RUNTIME=0 -sINVOKE_RUN=0 \
++  -sMODULARIZE=1 -sEXPORT_NAME=create3SX -sENVIRONMENT=web \
++  -sEXPORTED_RUNTIME_METHODS=FS,IDBFS,callMain,addRunDependency,removeRunDependency -lidbfs.js \
++  --preload-file "$ROOT/assets@/assets" \
++  -o "$OUT/3sx.js"
++cp "$ROOT"/web/shell/* "$OUT"/
++echo "built $OUT/3sx.js"
+diff --git a/web/shell/index.html b/web/shell/index.html
+new file mode 100644
+index 00000000..84f24e84
+--- /dev/null
++++ b/web/shell/index.html
+@@ -0,0 +1,57 @@
++<!doctype html>
++<html lang="en">
++<head>
++<meta charset="utf-8">
++<meta name="viewport" content="width=device-width, initial-scale=1">
++<title>3SX Web</title>
++<link rel="preconnect" href="https://fonts.googleapis.com">
++<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
++<link href="https://fonts.googleapis.com/css2?family=Fredoka:wght@500;700&display=swap" rel="stylesheet">
++<link rel="stylesheet" href="shell.css">
++</head>
++<body>
++<canvas id="canvas" tabindex="-1" oncontextmenu="event.preventDefault()"></canvas>
++
++<main id="launcher">
++  <h1>3SX <span>WEB</span></h1>
++  <p class="tag">Street Fighter III: 3rd Strike, running natively in your browser.</p>
++
++  <section class="card" id="need-file">
++    <h2>Insert your disc data</h2>
++    <p>3SX needs <code>SF33RD.AFS</code> from your own PS2 copy of <em>3rd Strike</em> or
++      <em>Street Fighter Anniversary Collection</em> (it's in the <code>THIRD</code> folder on the disc).
++      The file never leaves your computer. It's stored in this browser so you only pick it once.</p>
++    <label class="btn" id="pick-label">
++      <input type="file" id="pick" accept=".afs,.AFS">
++      CHOOSE SF33RD.AFS
++    </label>
++    <p class="hint">or drag and drop it anywhere on this page</p>
++  </section>
++
++  <section class="card" id="ready" hidden>
++    <h2>Ready</h2>
++    <p id="ready-text">Your disc data is loaded.</p>
++    <button class="btn" id="play">FIGHT!</button>
++    <button class="link" id="forget">use a different file</button>
++  </section>
++
++  <section class="card" id="busy" hidden>
++    <h2 id="busy-title">Loading</h2>
++    <progress id="bar" max="1" value="0"></progress>
++    <p id="busy-text"></p>
++  </section>
++
++  <p class="error" id="error" hidden></p>
++
++  <footer>
++    <p><b>Controls:</b> keyboard and gamepads work. F11 or Alt+Enter toggles fullscreen. Default keys: arrows or WASD move, U I J K and O P L ; are the attack buttons, Enter is Start.
++      Keys and pads can be remapped in the game's config.</p>
++    <p>3SX by <a href="https://github.com/crowded-street/3sx" target="_blank" rel="noopener">Crowded Street</a> (GPLv3),
++      compiled to WebAssembly. Street Fighter III: 3rd Strike &copy; Capcom. No game data is included on this page.</p>
++  </footer>
++</main>
++
++
++<script src="loader.js"></script>
++</body>
++</html>
+diff --git a/web/shell/loader.js b/web/shell/loader.js
+new file mode 100644
+index 00000000..30632a9c
+--- /dev/null
++++ b/web/shell/loader.js
+@@ -0,0 +1,231 @@
++(() => {
++  const EXPECTED_SHA = 'f9fa50f3a124ec9fa9465aa9c8546c2d867887eb39f711a070762a0324ba5604';
++  const EXPECTED_SIZE = 642492416;
++  const DB_NAME = '3sx-web';
++  const STORE = 'files';
++  const KEY = 'SF33RD.AFS';
++  const PREF = '/libsdl/CrowdedStreet/3SX';
++
++  const $ = id => document.getElementById(id);
++  const show = (id, on) => { $(id).hidden = !on; };
++  let afsBlob = null;
++  let started = false;
++
++  function setError(msg) {
++    $('error').textContent = msg || '';
++    show('error', !!msg);
++  }
++
++  function busy(title, text, value) {
++    show('need-file', false);
++    show('ready', false);
++    show('busy', true);
++    $('busy-title').textContent = title;
++    $('busy-text').textContent = text || '';
++    if (value === undefined) $('bar').removeAttribute('value');
++    else $('bar').value = value;
++  }
++
++  function openDb() {
++    return new Promise((resolve, reject) => {
++      const req = indexedDB.open(DB_NAME, 1);
++      req.onupgradeneeded = () => req.result.createObjectStore(STORE);
++      req.onsuccess = () => resolve(req.result);
++      req.onerror = () => reject(req.error);
++    });
++  }
++
++  async function dbGet() {
++    try {
++      const db = await openDb();
++      return await new Promise((resolve, reject) => {
++        const req = db.transaction(STORE).objectStore(STORE).get(KEY);
++        req.onsuccess = () => resolve(req.result || null);
++        req.onerror = () => reject(req.error);
++      });
++    } catch (e) {
++      return null;
++    }
++  }
++
++  async function dbPut(blob) {
++    try {
++      const db = await openDb();
++      await new Promise((resolve, reject) => {
++        const tx = db.transaction(STORE, 'readwrite');
++        tx.objectStore(STORE).put(blob, KEY);
++        tx.oncomplete = resolve;
++        tx.onerror = () => reject(tx.error);
++      });
++    } catch (e) {
++      console.warn('Could not cache AFS in IndexedDB', e);
++    }
++  }
++
++  async function dbDelete() {
++    try {
++      const db = await openDb();
++      db.transaction(STORE, 'readwrite').objectStore(STORE).delete(KEY);
++    } catch (e) {}
++  }
++
++  const hex = buf => [...new Uint8Array(buf)].map(b => b.toString(16).padStart(2, '0')).join('');
++
++  async function verify(blob) {
++    if (blob.size !== EXPECTED_SIZE) {
++      throw new Error(`That file is ${blob.size.toLocaleString()} bytes, but SF33RD.AFS should be ${EXPECTED_SIZE.toLocaleString()} bytes. Make sure you picked THIRD/SF33RD.AFS from the PS2 disc.`);
++    }
++    if (!(window.crypto && crypto.subtle)) return;
++    busy('Checking file', 'Verifying checksum...');
++    const digest = hex(await crypto.subtle.digest('SHA-256', await blob.arrayBuffer()));
++    if (digest !== EXPECTED_SHA) {
++      throw new Error('Checksum mismatch: this is not the SF33RD.AFS 3SX expects (it must come from the PS2 release).');
++    }
++  }
++
++  async function accept(blob, fromUser) {
++    setError('');
++    try {
++      await verify(blob);
++      afsBlob = blob;
++      if (fromUser) {
++        busy('Saving', 'Storing the file in this browser so you only have to pick it once...');
++        await dbPut(blob);
++      }
++      showReady();
++    } catch (e) {
++      afsBlob = null;
++      setError(e.message);
++      showPicker();
++    }
++  }
++
++  function showPicker() {
++    show('busy', false);
++    show('ready', false);
++    show('need-file', true);
++  }
++
++  function showReady() {
++    show('busy', false);
++    show('need-file', false);
++    show('ready', true);
++    $('play').focus();
++  }
++
++  function syncFs(FS, populate) {
++    return new Promise(resolve => FS.syncfs(populate, err => {
++      if (err) console.warn('IDBFS sync failed', err);
++      resolve();
++    }));
++  }
++
++  async function start() {
++    if (started || !afsBlob) return;
++    started = true;
++    busy('Loading', 'Reading disc data into memory...');
++    const data = new Uint8Array(await afsBlob.arrayBuffer());
++    busy('Loading', 'Starting the game...');
++
++    const canvas = $('canvas');
++    document.body.classList.add('playing');
++
++    const moduleConfig = {
++      canvas,
++      noInitialRun: true,
++      print: t => console.log(t),
++      printErr: t => console.warn(t),
++      locateFile: f => f,
++      preRun: [
++        mod => {
++          const FS = mod.FS;
++          FS.mkdir('/libsdl');
++          FS.mount(mod.IDBFS, {}, '/libsdl');
++          mod.addRunDependency('idbfs');
++          FS.syncfs(true, err => {
++            if (err) console.warn('IDBFS load failed', err);
++            mod.removeRunDependency('idbfs');
++          });
++          FS.mkdir('/afs');
++          FS.writeFile('/afs/SF33RD.AFS', data, { canOwn: true });
++        },
++      ],
++    };
++
++    const mod = await create3SX(moduleConfig);
++    const FS = mod.FS;
++    const mkdirp = p => {
++      let cur = '';
++      for (const part of p.split('/').filter(Boolean)) {
++        cur += '/' + part;
++        try { FS.mkdir(cur); } catch (e) {}
++      }
++    };
++    mkdirp(PREF);
++    await syncFs(FS, false);
++
++    setInterval(() => syncFs(FS, false), 5000);
++    window.addEventListener('pagehide', () => syncFs(FS, false));
++    document.addEventListener('visibilitychange', () => { if (document.hidden) syncFs(FS, false); });
++    window.__3sx = mod;
++
++    try {
++      mod.callMain([]);
++    } catch (e) {
++      if (e && e.name !== 'ExitStatus' && e !== 'unwind') throw e;
++    }
++    canvas.focus();
++  }
++
++  $('pick').addEventListener('change', e => {
++    const f = e.target.files && e.target.files[0];
++    if (f) accept(f, true);
++  });
++  $('play').addEventListener('click', start);
++  $('forget').addEventListener('click', async () => {
++    await dbDelete();
++    afsBlob = null;
++    showPicker();
++  });
++
++  window.addEventListener('dragover', e => { e.preventDefault(); document.body.classList.add('dragging'); });
++  window.addEventListener('dragleave', () => document.body.classList.remove('dragging'));
++  window.addEventListener('drop', e => {
++    e.preventDefault();
++    document.body.classList.remove('dragging');
++    const f = e.dataTransfer.files && e.dataTransfer.files[0];
++    if (f && !started) accept(f, true);
++  });
++  window.addEventListener('keydown', e => {
++    if (!started && e.key === 'Enter' && !$('ready').hidden) start();
++  });
++
++  async function init() {
++    const script = document.createElement('script');
++    script.src = '3sx.js';
++    document.head.appendChild(script);
++
++    busy('Loading', 'Looking for your disc data...');
++    const cached = await dbGet();
++    if (cached) {
++      afsBlob = cached;
++      $('ready-text').textContent = 'Using the SF33RD.AFS saved in this browser.';
++      showReady();
++      return;
++    }
++    try {
++      const head = await fetch('SF33RD.AFS', { method: 'HEAD' });
++      if (head.ok && +head.headers.get('content-length') === EXPECTED_SIZE) {
++        busy('Loading', 'Found SF33RD.AFS next to the game, reading it...');
++        const blob = await (await fetch('SF33RD.AFS')).blob();
++        afsBlob = blob;
++        $('ready-text').textContent = 'Using SF33RD.AFS from the game folder.';
++        showReady();
++        return;
++      }
++    } catch (e) {}
++    showPicker();
++  }
++
++  init();
++})();
+diff --git a/web/shell/shell.css b/web/shell/shell.css
+new file mode 100644
+index 00000000..0184026f
+--- /dev/null
++++ b/web/shell/shell.css
+@@ -0,0 +1,141 @@
++:root {
++  --bg: #120a16;
++  --card: #1f1326;
++  --ink: #fff6e8;
++  --dim: #b8a8c0;
++  --red: #ff3b30;
++  --gold: #ffc53d;
++  --outline: #07030a;
++}
++
++* { box-sizing: border-box; }
++
++html, body {
++  margin: 0;
++  min-height: 100%;
++  background: radial-gradient(ellipse at top, #3a1030 0%, var(--bg) 60%);
++  color: var(--ink);
++  font-family: "Fredoka", system-ui, sans-serif;
++}
++
++#canvas {
++  display: none;
++  position: fixed;
++  inset: 0;
++  width: 100vw;
++  height: 100vh;
++  background: #000;
++  outline: none;
++}
++
++body.playing #canvas { display: block; }
++body.playing #launcher { display: none; }
++body.playing { background: #000; overflow: hidden; }
++
++#launcher {
++  max-width: 640px;
++  margin: 0 auto;
++  padding: 40px 18px 30px;
++  display: flex;
++  flex-direction: column;
++  gap: 18px;
++}
++
++h1 {
++  margin: 0;
++  font-size: clamp(56px, 16vw, 110px);
++  font-weight: 700;
++  line-height: 0.9;
++  letter-spacing: 0.02em;
++  color: var(--gold);
++  -webkit-text-stroke: 5px var(--outline);
++  paint-order: stroke fill;
++  text-shadow: 6px 6px 0 var(--red);
++}
++
++h1 span { color: var(--ink); }
++
++.tag { margin: 0; color: var(--dim); font-size: 18px; }
++
++.card {
++  background: var(--card);
++  border: 4px solid var(--outline);
++  border-radius: 18px;
++  box-shadow: 6px 6px 0 var(--outline);
++  padding: 18px 20px 20px;
++}
++
++.card[hidden] { display: none; }
++
++h2 { margin: 0 0 8px; font-size: 26px; }
++
++.card p { margin: 0 0 14px; line-height: 1.45; color: var(--dim); }
++
++code { color: var(--gold); font-weight: 700; }
++
++.btn {
++  display: inline-block;
++  font: 700 22px "Fredoka", system-ui, sans-serif;
++  letter-spacing: 0.04em;
++  color: var(--outline);
++  background: var(--gold);
++  border: 4px solid var(--outline);
++  border-radius: 14px;
++  box-shadow: 4px 4px 0 var(--outline);
++  padding: 12px 26px;
++  cursor: pointer;
++  transition: transform 0.06s, box-shadow 0.06s;
++}
++
++.btn:hover { background: #ffd66e; }
++.btn:active { transform: translate(3px, 3px); box-shadow: 1px 1px 0 var(--outline); }
++.btn input { display: none; }
++
++#play { background: var(--red); color: var(--ink); font-size: 30px; padding: 12px 40px; }
++#play:hover { background: #ff5a51; }
++
++.link {
++  background: none;
++  border: none;
++  color: var(--dim);
++  font: 500 15px "Fredoka", sans-serif;
++  text-decoration: underline;
++  cursor: pointer;
++  margin-left: 14px;
++}
++
++.hint { margin: 10px 0 0 !important; font-size: 14px; }
++
++progress { width: 100%; height: 16px; accent-color: var(--gold); }
++
++.error {
++  margin: 0;
++  background: #4a0d12;
++  border: 3px solid var(--red);
++  border-radius: 12px;
++  padding: 12px 14px;
++}
++
++footer { color: var(--dim); font-size: 13px; line-height: 1.5; }
++footer p { margin: 0 0 6px; }
++a { color: var(--gold); }
++
++body.dragging #launcher { outline: 4px dashed var(--gold); outline-offset: -8px; border-radius: 18px; }
++
++.fs {
++  position: fixed;
++  right: 12px;
++  bottom: 12px;
++  z-index: 10;
++  width: 44px;
++  height: 44px;
++  font-size: 22px;
++  border-radius: 12px;
++  border: 3px solid var(--outline);
++  background: rgba(255, 197, 61, 0.85);
++  cursor: pointer;
++  opacity: 0.35;
++  transition: opacity 0.2s;
++}
++
++.fs:hover { opacity: 1; }

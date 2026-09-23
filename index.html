@@ -1,0 +1,138 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>3SX Web</title>
+
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Fredoka:wght@500;700&display=swap">
+
+<link rel="stylesheet" href="shell.css">
+</head>
+
+<body>
+
+<canvas
+  id="canvas"
+  tabindex="-1"
+  oncontextmenu="event.preventDefault()">
+</canvas>
+
+<main id="launcher">
+
+  <h1>3SX <span>WEB</span></h1>
+
+  <p class="tag">
+    Street Fighter III: 3rd Strike, running natively in your browser.
+  </p>
+
+  <!-- Connected controller -->
+  <div class="device-status" id="device-status">
+    <span class="device-dot"></span>
+    <div>
+      <strong>Connected Device</strong>
+      <span id="device-name">No controller connected</span>
+    </div>
+  </div>
+
+  <!-- Disc data preparation -->
+  <section class="card" id="need-file">
+
+    <h2>Preparing disc data</h2>
+
+    <p>
+      3SX is preparing the required
+      <code>SF33RD.AFS</code> disc data.
+      The data is downloaded as multiple parts and automatically
+      combined in your browser into the format 3SX needs.
+    </p>
+
+    <p class="hint">
+      Once combined, the data is stored in this browser so it does
+      not need to be downloaded and combined again on your next visit.
+    </p>
+
+  </section>
+
+  <!-- Ready -->
+  <section class="card" id="ready" hidden>
+
+    <h2>Ready</h2>
+
+    <p id="ready-text">
+      Your disc data is ready.
+    </p>
+
+    <button class="btn" id="play">
+      FIGHT!
+    </button>
+
+  </section>
+
+  <!-- Loading / merging -->
+  <section class="card" id="busy" hidden>
+
+    <h2 id="busy-title">
+      Loading
+    </h2>
+
+    <progress
+      id="bar"
+      max="1"
+      value="0">
+    </progress>
+
+    <p id="busy-text"></p>
+
+  </section>
+
+  <p class="error" id="error" hidden></p>
+
+  <footer>
+
+    <p>
+      <b>Controls:</b>
+      keyboard and gamepads work.
+      F11 or Alt+Enter toggles fullscreen.
+      Default keys: arrows or WASD move,
+      U I J K and O P L ; are the attack buttons,
+      Enter is Start.
+      Xbox, PlayStation, and Nintendo Switch controllers
+      are supported.
+      Keys and pads can be remapped in the game's config.
+    </p>
+
+    <p>
+      <b>Made by</b>
+    </p>
+
+    <p>
+      <a
+        href="https://github.com/crowded-street/3sx"
+        target="_blank"
+        rel="noopener">
+        Crowded Street
+      </a>
+      — the team behind 3SX.
+    </p>
+
+    <p>
+      3SX is licensed under GPLv3 and compiled to WebAssembly.
+      Street Fighter III: 3rd Strike &copy; Capcom.
+      No game data is included on this page.
+    </p>
+
+  </footer>
+
+</main>
+
+<!-- Controller support -->
+<script src="controller.js"></script>
+
+<!-- 3SX launcher and automatic AFS merging -->
+<script src="loader.js"></script>
+
+</body>
+</html>

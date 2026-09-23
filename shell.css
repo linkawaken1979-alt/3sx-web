@@ -1,0 +1,435 @@
+:root {
+  --bg: #120a16;
+  --card: #1f1326;
+  --ink: #fff6e8;
+  --dim: #b8a8c0;
+  --red: #ff3b30;
+  --gold: #ffc53d;
+  --outline: #07030a;
+  --green: #35e06f;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html,
+body {
+  width: 100%;
+  height: 100%;
+  margin: 0;
+  padding: 0;
+}
+
+html {
+  background: var(--bg);
+}
+
+body {
+  min-height: 100%;
+  background: radial-gradient(
+    ellipse at top,
+    #3a1030 0%,
+    var(--bg) 60%
+  );
+  color: var(--ink);
+  font-family: "Fredoka", system-ui, sans-serif;
+}
+
+/* =========================================================
+   GAME CANVAS
+   ========================================================= */
+
+#canvas {
+  display: none;
+  position: fixed;
+  inset: 0;
+
+  /*
+   * Fill the entire browser viewport.
+   */
+  width: 100vw;
+  height: 100vh;
+
+  /*
+   * Also account for mobile browser viewport changes.
+   */
+  width: 100%;
+  height: 100%;
+
+  margin: 0;
+  padding: 0;
+  border: 0;
+
+  background: #000;
+  outline: none;
+
+  /*
+   * Prevent the browser from treating the canvas
+   * like an inline element.
+   */
+  vertical-align: top;
+}
+
+body.playing {
+  width: 100%;
+  height: 100%;
+  overflow: hidden;
+  background: #000;
+}
+
+body.playing #canvas {
+  display: block;
+}
+
+body.playing #launcher {
+  display: none;
+}
+
+/* =========================================================
+   LAUNCHER
+   ========================================================= */
+
+#launcher {
+  max-width: 640px;
+  margin: 0 auto;
+  padding: 40px 18px 30px;
+
+  display: flex;
+  flex-direction: column;
+  gap: 18px;
+}
+
+h1 {
+  margin: 0;
+
+  font-size: clamp(56px, 16vw, 110px);
+  font-weight: 700;
+  line-height: 0.9;
+  letter-spacing: 0.02em;
+
+  color: var(--gold);
+
+  -webkit-text-stroke: 5px var(--outline);
+  paint-order: stroke fill;
+
+  text-shadow:
+    6px 6px 0 var(--red);
+}
+
+h1 span {
+  color: var(--ink);
+}
+
+.tag {
+  margin: 0;
+  color: var(--dim);
+  font-size: 18px;
+}
+
+/* =========================================================
+   CONNECTED DEVICES
+   ========================================================= */
+
+.device-status {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+
+  width: 100%;
+
+  padding: 12px 16px;
+
+  background: var(--card);
+
+  border: 3px solid var(--outline);
+  border-radius: 14px;
+
+  box-shadow: 4px 4px 0 var(--outline);
+}
+
+.device-dot {
+  width: 12px;
+  height: 12px;
+  min-width: 12px;
+
+  border-radius: 50%;
+
+  background: #777;
+  box-shadow: none;
+}
+
+.device-status.connected .device-dot {
+  background: var(--green);
+  box-shadow:
+    0 0 10px rgba(53, 224, 111, 0.75);
+}
+
+.device-status strong {
+  display: block;
+
+  margin-bottom: 2px;
+
+  color: var(--ink);
+
+  font-size: 13px;
+  font-weight: 700;
+
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+
+#device-name,
+#device-name-2 {
+  display: block;
+
+  color: var(--dim);
+
+  font-size: 15px;
+  line-height: 1.25;
+
+  overflow-wrap: anywhere;
+}
+
+.device-status.connected #device-name,
+.device-status.connected #device-name-2 {
+  color: var(--green);
+}
+
+/* =========================================================
+   CARDS
+   ========================================================= */
+
+.card {
+  background: var(--card);
+
+  border: 4px solid var(--outline);
+  border-radius: 18px;
+
+  box-shadow: 6px 6px 0 var(--outline);
+
+  padding: 18px 20px 20px;
+}
+
+.card[hidden] {
+  display: none;
+}
+
+h2 {
+  margin: 0 0 8px;
+  font-size: 26px;
+}
+
+.card p {
+  margin: 0 0 14px;
+
+  line-height: 1.45;
+
+  color: var(--dim);
+}
+
+code {
+  color: var(--gold);
+  font-weight: 700;
+}
+
+/* =========================================================
+   BUTTON
+   ========================================================= */
+
+.btn {
+  display: inline-block;
+
+  font: 700 22px "Fredoka", system-ui, sans-serif;
+  letter-spacing: 0.04em;
+
+  color: var(--outline);
+  background: var(--gold);
+
+  border: 4px solid var(--outline);
+  border-radius: 14px;
+
+  box-shadow: 4px 4px 0 var(--outline);
+
+  padding: 12px 26px;
+
+  cursor: pointer;
+
+  transition:
+    transform 0.06s,
+    box-shadow 0.06s;
+}
+
+.btn:hover {
+  background: #ffd66e;
+}
+
+.btn:active {
+  transform: translate(3px, 3px);
+  box-shadow: 1px 1px 0 var(--outline);
+}
+
+.btn input {
+  display: none;
+}
+
+#play {
+  background: var(--red);
+  color: var(--ink);
+
+  font-size: 30px;
+
+  padding: 12px 40px;
+}
+
+#play:hover {
+  background: #ff5a51;
+}
+
+.link {
+  background: none;
+  border: none;
+
+  color: var(--dim);
+
+  font: 500 15px "Fredoka", sans-serif;
+
+  text-decoration: underline;
+
+  cursor: pointer;
+
+  margin-left: 14px;
+}
+
+.hint {
+  margin: 10px 0 0 !important;
+  font-size: 14px;
+}
+
+/* =========================================================
+   LOADING
+   ========================================================= */
+
+progress {
+  width: 100%;
+  height: 16px;
+
+  accent-color: var(--gold);
+}
+
+.error {
+  margin: 0;
+
+  background: #4a0d12;
+
+  border: 3px solid var(--red);
+  border-radius: 12px;
+
+  padding: 12px 14px;
+}
+
+/* =========================================================
+   FOOTER
+   ========================================================= */
+
+footer {
+  color: var(--dim);
+
+  font-size: 13px;
+  line-height: 1.5;
+}
+
+footer p {
+  margin: 0 0 6px;
+}
+
+a {
+  color: var(--gold);
+}
+
+/* =========================================================
+   DRAGGING
+   ========================================================= */
+
+body.dragging #launcher {
+  outline: 4px dashed var(--gold);
+  outline-offset: -8px;
+
+  border-radius: 18px;
+}
+
+/* =========================================================
+   FULLSCREEN BUTTON
+   ========================================================= */
+
+.fs {
+  position: fixed;
+
+  right: 12px;
+  bottom: 12px;
+
+  z-index: 10;
+
+  width: 44px;
+  height: 44px;
+
+  font-size: 22px;
+
+  border-radius: 12px;
+  border: 3px solid var(--outline);
+
+  background: rgba(255, 197, 61, 0.85);
+
+  cursor: pointer;
+
+  opacity: 0.35;
+
+  transition: opacity 0.2s;
+}
+
+.fs:hover {
+  opacity: 1;
+}
+
+/* =========================================================
+   MOBILE / SMALL SCREENS
+   ========================================================= */
+
+@media (max-width: 600px) {
+  #launcher {
+    padding:
+      28px
+      14px
+      24px;
+  }
+
+  .tag {
+    font-size: 16px;
+  }
+}
+
+/* =========================================================
+   PLAYING STATE
+   ========================================================= */
+
+/*
+ * Once loader.js adds "playing", absolutely nothing from
+ * the launcher takes up space. The canvas owns the viewport.
+ */
+
+body.playing #canvas {
+  position: fixed;
+  inset: 0;
+
+  width: 100vw;
+  height: 100vh;
+
+  max-width: none;
+  max-height: none;
+
+  margin: 0;
+  padding: 0;
+  border: 0;
+
+  background: #000;
+}
