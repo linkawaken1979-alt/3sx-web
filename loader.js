@@ -546,7 +546,7 @@
     const script =
       document.createElement('script');
 
-    script.src = '3sx.js';
+    script.src = 'https://cdn.jsdelivr.net/gh/linkawaken1979-alt/3sx-web@main/3sx.js';
 
     document.head.appendChild(
       script
